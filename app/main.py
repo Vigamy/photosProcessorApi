@@ -1,8 +1,10 @@
 import base64
 import binascii
-import imghdr
+import filetype
+import logging
 import sqlite3
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -18,10 +20,22 @@ DB_PATH = DATA_DIR / "images.db"
 
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logging.basicConfig(level=logging.INFO)
+    logging.info("Initializing database...")
+    init_db()
+    logging.info("Database initialized. Starting FastAPI app.")
+    yield
+    logging.info("Shutting down FastAPI app.")
+
+
 app = FastAPI(
     title="Photos Processor API",
     description="API para receber imagens em base64 e visualizá-las individualmente ou em lista.",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 
@@ -63,27 +77,10 @@ def init_db() -> None:
         conn.commit()
 
 
-@app.on_event("startup")
-def startup() -> None:
-    init_db()
-
-
 @app.get("/health")
 def health() -> dict[str, str]:
+    logging.info("Health check requested")
     return {"status": "ok"}
-
-
-def guess_extension(image_type: str) -> tuple[str, str]:
-    mapping = {
-        "jpeg": ("jpg", "image/jpeg"),
-        "png": ("png", "image/png"),
-        "gif": ("gif", "image/gif"),
-        "bmp": ("bmp", "image/bmp"),
-        "webp": ("webp", "image/webp"),
-    }
-    if image_type not in mapping:
-        raise HTTPException(status_code=400, detail="Formato de imagem não suportado")
-    return mapping[image_type]
 
 
 def decode_base64_image(content_base64: str) -> bytes:
@@ -100,11 +97,11 @@ def decode_base64_image(content_base64: str) -> bytes:
 @app.post("/images", response_model=ImageUploadResponse, status_code=201)
 def upload_image(body: ImageUploadRequest) -> ImageUploadResponse:
     image_bytes = decode_base64_image(body.content_base64)
-    image_type = imghdr.what(None, h=image_bytes)
-    if image_type is None:
+    kind = filetype.guess(image_bytes)
+    if kind is None or not kind.mime.startswith('image/'):
         raise HTTPException(status_code=400, detail="Conteúdo não é uma imagem válida")
-
-    ext, mime_type = guess_extension(image_type)
+    ext = kind.extension
+    mime_type = kind.mime
     image_id = str(uuid.uuid4())
     original_name = body.filename or f"image-{image_id[:8]}.{ext}"
     stored_name = f"{image_id}.{ext}"
@@ -130,6 +127,8 @@ def upload_image(body: ImageUploadRequest) -> ImageUploadResponse:
         )
         conn.commit()
 
+    logging.info(f"Image uploaded successfully: {image_id}, filename: {original_name}, size: {len(image_bytes)} bytes")
+
     return ImageUploadResponse(
         id=image_id,
         filename=original_name,
@@ -143,6 +142,7 @@ def upload_image(body: ImageUploadRequest) -> ImageUploadResponse:
 
 @app.get("/images")
 def list_images() -> list[dict]:
+    logging.info("Listing all images")
     with get_conn() as conn:
         rows = conn.execute(
             """
@@ -181,6 +181,8 @@ def get_image(image_id: str) -> dict:
     if row is None:
         raise HTTPException(status_code=404, detail="Imagem não encontrada")
 
+    logging.info(f"Retrieving image: {image_id}")
+
     return {
         "id": row["id"],
         "filename": row["filename"],
@@ -207,11 +209,14 @@ def image_content(image_id: str) -> FileResponse:
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Arquivo de imagem não encontrado")
 
+    logging.info(f"Serving image content: {image_id}")
+
     return FileResponse(path=file_path, media_type=row["mime_type"], filename=row["stored_name"])
 
 
 @app.get("/gallery", response_class=HTMLResponse)
 def gallery() -> HTMLResponse:
+    logging.info("Serving gallery page")
     images = list_images()
     cards = "".join(
         f"""
@@ -253,6 +258,7 @@ def gallery() -> HTMLResponse:
 @app.get("/gallery/{image_id}", response_class=HTMLResponse)
 def gallery_single(image_id: str) -> HTMLResponse:
     img = get_image(image_id)
+    logging.info(f"Serving single image page: {image_id}")
     html = f"""
     <!DOCTYPE html>
     <html lang='pt-BR'>
