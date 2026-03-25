@@ -18,11 +18,13 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
 
-Defina o token Bearer da API antes de iniciar:
+Você pode definir o token Bearer da API antes de iniciar:
 
 ```bash
 export API_BEARER_TOKEN="seu-token-aqui"
 ```
+
+Se `API_BEARER_TOKEN` não for definido, a API gera automaticamente um token e persiste em `data/api_token.txt` (também aparece no log de startup).
 
 Acesse:
 

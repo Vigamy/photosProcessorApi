@@ -1,6 +1,7 @@
 import filetype
 import logging
 import os
+import secrets
 import sqlite3
 import uuid
 from contextlib import asynccontextmanager
@@ -16,9 +17,27 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 IMAGES_DIR = DATA_DIR / "images"
 DB_PATH = DATA_DIR / "images.db"
-API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN", "change-this-token")
+TOKEN_PATH = DATA_DIR / "api_token.txt"
 
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_or_create_api_token() -> str:
+    env_token = os.getenv("API_BEARER_TOKEN")
+    if env_token:
+        return env_token
+
+    if TOKEN_PATH.exists():
+        stored_token = TOKEN_PATH.read_text(encoding="utf-8").strip()
+        if stored_token:
+            return stored_token
+
+    generated_token = secrets.token_urlsafe(32)
+    TOKEN_PATH.write_text(generated_token, encoding="utf-8")
+    return generated_token
+
+
+API_BEARER_TOKEN = load_or_create_api_token()
 
 
 @asynccontextmanager
@@ -26,6 +45,9 @@ async def lifespan(app: FastAPI):
     logging.basicConfig(level=logging.INFO)
     logging.info("Initializing database...")
     init_db()
+    logging.info("Bearer token ativo em %s", TOKEN_PATH)
+    if not os.getenv("API_BEARER_TOKEN"):
+        logging.info("Token gerado automaticamente: %s", API_BEARER_TOKEN)
     logging.info("Database initialized. Starting FastAPI app.")
     yield
     logging.info("Shutting down FastAPI app.")
