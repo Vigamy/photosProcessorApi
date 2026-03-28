@@ -72,7 +72,7 @@ curl -sS -X POST "http://127.0.0.1:8000/image" \
 
 ## Deploy na Vercel
 
-Este repositório já está preparado para deploy com Vercel usando função Python (`api/index.py`) e roteamento completo via `vercel.json`.
+Este repositório já está preparado para deploy com Vercel usando função Python (`api/index.py`) e roteamento completo via `vercel.json`. O runtime Python é detectado automaticamente pela Vercel (sem fixar versão no `vercel.json`).
 
 ### 1) Pré-requisitos
 
