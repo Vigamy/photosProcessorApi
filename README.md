@@ -105,9 +105,9 @@ No ambiente serverless da Vercel, o filesystem é efêmero. Nesta API, os upload
 
 Se você quiser persistência real em produção, troque armazenamento local/SQLite por serviços externos (ex.: Vercel Blob, S3, Postgres, Supabase etc.).
 
-## CI para deploy automático em PR (Vercel Preview)
+## CI para deploy automático (Preview em PR + Produção na main)
 
-Foi adicionado um workflow do GitHub Actions em `.github/workflows/vercel-preview.yml` que publica um preview a cada PR (`opened`, `synchronize`, `reopened`) e comenta a URL no próprio PR.
+Foi adicionado um workflow do GitHub Actions em `.github/workflows/vercel-preview.yml` que publica um preview a cada PR (`opened`, `synchronize`, `reopened`) e comenta a URL no próprio PR. Além disso, em `push` para `main`, ele faz deploy de produção automaticamente.
 
 ### Secrets necessários no GitHub
 
@@ -122,4 +122,6 @@ No repositório, configure em **Settings → Secrets and variables → Actions**
 - `VERCEL_TOKEN`: em Vercel → Account Settings → Tokens
 - `VERCEL_ORG_ID` e `VERCEL_PROJECT_ID`: após rodar localmente `vercel link`/`vercel pull`, eles ficam no arquivo `.vercel/project.json`
 
-Com isso, toda atualização no PR dispara deploy de preview automaticamente.
+Com isso, toda atualização no PR dispara deploy de preview automaticamente, e cada atualização na branch `main` dispara deploy de produção.
+
+> Se algum secret estiver ausente, o workflow não falha por credencial: ele comenta no PR quais secrets faltam e pula o deploy.
