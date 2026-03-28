@@ -3,25 +3,30 @@ import logging
 import os
 import secrets
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Optional
 
 from dotenv import load_dotenv
 import psycopg
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse
+from psycopg_pool import ConnectionPool, PoolTimeout
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel
 from psycopg.rows import dict_row
 
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = Path("/tmp/photos-processor-data") if os.getenv("VERCEL") else (BASE_DIR / "data")
+IS_VERCEL = bool(os.getenv("VERCEL"))
+DATA_DIR = Path("/tmp/photos-processor-data") if IS_VERCEL else (BASE_DIR / "data")
 IMAGES_DIR = DATA_DIR / "images"
 TOKEN_PATH = DATA_DIR / "api_token.txt"
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+DB_POOL_MAX_SIZE = int(os.getenv("DB_POOL_MAX_SIZE", "3"))
+USE_DB_POOL = os.getenv("USE_DB_POOL", "").lower() in {"1", "true", "yes"}
+db_pool: Optional[ConnectionPool] = None
 
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -50,14 +55,29 @@ API_BEARER_TOKEN = load_or_create_api_token()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global db_pool
     logging.basicConfig(level=logging.INFO)
     logging.info("Initializing database...")
-    init_db()
+    if DATABASE_URL and USE_DB_POOL:
+        db_pool = ConnectionPool(
+            conninfo=DATABASE_URL,
+            min_size=0,
+            max_size=max(1, DB_POOL_MAX_SIZE),
+            kwargs={"connect_timeout": 5},
+            open=False,
+            timeout=2,
+        )
+    db_ready = init_db()
     logging.info("Bearer token ativo em %s", TOKEN_PATH)
     if not os.getenv("API_BEARER_TOKEN"):
         logging.info("Token gerado automaticamente: %s", API_BEARER_TOKEN)
-    logging.info("Database initialized. Starting FastAPI app.")
+    if db_ready:
+        logging.info("Database initialized. Starting FastAPI app.")
+    else:
+        logging.warning("Database unavailable on startup. API started with degraded mode (DB endpoints may return 503).")
     yield
+    if db_pool is not None:
+        db_pool.close()
     logging.info("Shutting down FastAPI app.")
 
 
@@ -89,31 +109,58 @@ class ImageItem(BaseModel):
     gallery_url: str
 
 
+@contextmanager
 def get_conn():
     if not DATABASE_URL:
         raise RuntimeError(
             "DATABASE_URL não definido. Configure um Postgres válido, por exemplo: "
             "postgresql://postgres:postgres@localhost:5432/photos_processor"
         )
-    return psycopg.connect(DATABASE_URL)
+    try:
+        if db_pool is not None:
+            with db_pool.connection() as conn:
+                yield conn
+            return
+        with psycopg.connect(DATABASE_URL, connect_timeout=5) as conn:
+            yield conn
+    except (psycopg.OperationalError, PoolTimeout) as exc:
+        raise RuntimeError("Banco de dados indisponível no momento") from exc
 
 
-def init_db() -> None:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS images (
-                    id VARCHAR(64) PRIMARY KEY,
-                    filename TEXT NOT NULL,
-                    stored_name TEXT NOT NULL,
-                    mime_type TEXT NOT NULL,
-                    size_bytes INTEGER NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL
+def database_unavailable_http_exception() -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail="Banco de dados indisponível no momento. Tente novamente em instantes.",
+    )
+
+
+def init_db() -> bool:
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS images (
+                        id VARCHAR(64) PRIMARY KEY,
+                        filename TEXT NOT NULL,
+                        stored_name TEXT NOT NULL,
+                        mime_type TEXT NOT NULL,
+                        size_bytes INTEGER NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL,
+                        client_ip TEXT NULL,
+                        username TEXT NULL,
+                        image_data BYTEA NULL
+                    )
+                    """
                 )
-                """
-            )
-        conn.commit()
+                cur.execute("ALTER TABLE images ADD COLUMN IF NOT EXISTS client_ip TEXT NULL")
+                cur.execute("ALTER TABLE images ADD COLUMN IF NOT EXISTS username TEXT NULL")
+                cur.execute("ALTER TABLE images ADD COLUMN IF NOT EXISTS image_data BYTEA NULL")
+            conn.commit()
+        return True
+    except RuntimeError:
+        logging.exception("Não foi possível inicializar o banco de dados")
+        return False
 
 
 @app.get("/health")
@@ -160,16 +207,19 @@ def to_image_item(row: dict) -> ImageItem:
 
 
 def fetch_all_images() -> list[ImageItem]:
-    with get_conn() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(
-                """
-                SELECT id, filename, mime_type, size_bytes, created_at
-                FROM images
-                ORDER BY created_at DESC
-                """
-            )
-            rows = cur.fetchall()
+    try:
+        with get_conn() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT id, filename, mime_type, size_bytes, created_at
+                    FROM images
+                    ORDER BY created_at DESC
+                    """
+                )
+                rows = cur.fetchall()
+    except RuntimeError as exc:
+        raise database_unavailable_http_exception() from exc
     return [to_image_item(row) for row in rows]
 
 
@@ -179,7 +229,11 @@ def fetch_all_images() -> list[ImageItem]:
     status_code=201,
     dependencies=[Depends(require_bearer_auth)],
 )
-async def upload_image(file: UploadFile = File(...)) -> ImageUploadResponse:
+async def upload_image(
+    request: Request,
+    file: UploadFile = File(...),
+    username: Optional[str] = Form(default=None),
+) -> ImageUploadResponse:
     image_bytes = await file.read()
     kind = filetype.guess(image_bytes)
     if kind is None or not kind.mime.startswith('image/'):
@@ -190,28 +244,50 @@ async def upload_image(file: UploadFile = File(...)) -> ImageUploadResponse:
     image_id = str(uuid.uuid4())
     original_name = file.filename or f"image-{image_id[:8]}.{ext}"
     stored_name = f"{image_id}.{ext}"
-    output_path = IMAGES_DIR / stored_name
-    output_path.write_bytes(image_bytes)
+    if not IS_VERCEL:
+        output_path = IMAGES_DIR / stored_name
+        output_path.write_bytes(image_bytes)
 
     created_at = datetime.now(timezone.utc).isoformat()
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        client_ip = forwarded_for.split(",")[0].strip() or None
+    else:
+        client_ip = request.client.host if request.client else None
 
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO images (id, filename, stored_name, mime_type, size_bytes, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    image_id,
-                    original_name,
-                    stored_name,
-                    mime_type,
-                    len(image_bytes),
-                    created_at,
-                ),
-            )
-        conn.commit()
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO images (
+                        id,
+                        filename,
+                        stored_name,
+                        mime_type,
+                        size_bytes,
+                        created_at,
+                        client_ip,
+                        username,
+                        image_data
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        image_id,
+                        original_name,
+                        stored_name,
+                        mime_type,
+                        len(image_bytes),
+                        created_at,
+                        client_ip,
+                        username,
+                        image_bytes,
+                    ),
+                )
+            conn.commit()
+    except RuntimeError as exc:
+        raise database_unavailable_http_exception() from exc
 
     logging.info(f"Image uploaded successfully: {image_id}, filename: {original_name}, size: {len(image_bytes)} bytes")
 
@@ -233,16 +309,19 @@ def list_images() -> list[ImageItem]:
 
 
 def get_image_metadata(image_id: str) -> dict:
-    with get_conn() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            row = cur.execute(
-                """
-                SELECT id, filename, stored_name, mime_type, size_bytes, created_at
-                FROM images
-                WHERE id = %s
-                """,
-                (image_id,),
-            ).fetchone()
+    try:
+        with get_conn() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                row = cur.execute(
+                    """
+                    SELECT id, filename, stored_name, mime_type, size_bytes, created_at, image_data
+                    FROM images
+                    WHERE id = %s
+                    """,
+                    (image_id,),
+                ).fetchone()
+    except RuntimeError as exc:
+        raise database_unavailable_http_exception() from exc
 
     if row is None:
         raise HTTPException(status_code=404, detail="Imagem não encontrada")
@@ -251,12 +330,15 @@ def get_image_metadata(image_id: str) -> dict:
 
 
 @app.get("/image/{image_id}")
-def get_image_by_id(image_id: str) -> FileResponse:
+def get_image_by_id(image_id: str) -> Response:
     row = get_image_metadata(image_id)
 
     file_path = IMAGES_DIR / row["stored_name"]
     if not file_path.exists():
-        raise HTTPException(status_code=404, detail="Arquivo de imagem não encontrado")
+        image_data = row.get("image_data")
+        if image_data is None:
+            raise HTTPException(status_code=404, detail="Arquivo de imagem não encontrado")
+        return Response(content=image_data, media_type=row["mime_type"])
 
     logging.info(f"Serving image content: {image_id}")
 
