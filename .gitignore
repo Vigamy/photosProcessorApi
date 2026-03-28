@@ -5,3 +5,4 @@ data/images/*
 data/images.db
 
 data/api_token.txt
+.vercel

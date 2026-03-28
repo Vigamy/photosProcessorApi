@@ -72,7 +72,7 @@ curl -sS -X POST "http://127.0.0.1:8000/image" \
 
 ## Deploy na Vercel
 
-Este repositório já está preparado para deploy com Vercel usando função Python (`api/index.py`) e roteamento completo via `vercel.json`.
+Este repositório já está preparado para deploy com Vercel usando função Python (`api/index.py`) e rewrite global no `vercel.json` para enviar todas as rotas para `/api/index`. O runtime Python é detectado automaticamente pela Vercel (sem fixar versão no `vercel.json`).
 
 ### 1) Pré-requisitos
 
@@ -104,3 +104,22 @@ vercel --prod
 No ambiente serverless da Vercel, o filesystem é efêmero. Nesta API, os uploads e o SQLite ficam em `/tmp/photos-processor-data`, ou seja, os dados podem ser perdidos entre execuções/cold starts.
 
 Se você quiser persistência real em produção, troque armazenamento local/SQLite por serviços externos (ex.: Vercel Blob, S3, Postgres, Supabase etc.).
+
+## CI para deploy automático em PR (Vercel Preview)
+
+Foi adicionado um workflow do GitHub Actions em `.github/workflows/vercel-preview.yml` que publica um preview a cada PR (`opened`, `synchronize`, `reopened`) e comenta a URL no próprio PR.
+
+### Secrets necessários no GitHub
+
+No repositório, configure em **Settings → Secrets and variables → Actions**:
+
+- `VERCEL_TOKEN`
+- `VERCEL_ORG_ID`
+- `VERCEL_PROJECT_ID`
+
+### Como obter os valores
+
+- `VERCEL_TOKEN`: em Vercel → Account Settings → Tokens
+- `VERCEL_ORG_ID` e `VERCEL_PROJECT_ID`: após rodar localmente `vercel link`/`vercel pull`, eles ficam no arquivo `.vercel/project.json`
+
+Com isso, toda atualização no PR dispara deploy de preview automaticamente.
