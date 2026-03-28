@@ -8,11 +8,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Optional
 
+from dotenv import load_dotenv
 import psycopg
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 from psycopg.rows import dict_row
+
+load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = Path("/tmp/photos-processor-data") if os.getenv("VERCEL") else (BASE_DIR / "data")
