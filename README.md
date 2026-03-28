@@ -114,11 +114,9 @@ Este repositório já está preparado para deploy com Vercel usando função Pyt
 No projeto da Vercel, configure:
 
 - `API_BEARER_TOKEN` = um token forte para autenticação
-- `DATABASE_URL` = string de conexão Postgres hospedado (recomendado para produção)
+- `DATABASE_URL` = string de conexão Postgres hospedado (**obrigatório**)
 
 > Sem essa variável, a API ainda sobe, mas usa token efêmero por instância no ambiente serverless.
->
-> Se `DATABASE_URL` não for definido, a aplicação faz fallback para SQLite local em `/tmp/photos-processor-data/metadata.db` para manter o app funcional (ambiente efêmero).
 
 ### 3) Fazer o deploy
 

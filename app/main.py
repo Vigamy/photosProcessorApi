@@ -2,7 +2,6 @@ import filetype
 import logging
 import os
 import secrets
-import sqlite3
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -19,9 +18,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = Path("/tmp/photos-processor-data") if os.getenv("VERCEL") else (BASE_DIR / "data")
 IMAGES_DIR = DATA_DIR / "images"
 TOKEN_PATH = DATA_DIR / "api_token.txt"
-SQLITE_DB_PATH = DATA_DIR / "metadata.db"
-DATABASE_URL = os.getenv("DATABASE_URL")
-USING_POSTGRES = bool(DATABASE_URL and DATABASE_URL.startswith(("postgres://", "postgresql://")))
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -89,31 +86,19 @@ class ImageItem(BaseModel):
     gallery_url: str
 
 
-def sqlite_dict_factory(cursor: sqlite3.Cursor, row: tuple) -> dict:
-    return {column[0]: row[index] for index, column in enumerate(cursor.description)}
-
-
 def get_conn():
-    if USING_POSTGRES:
-        return psycopg.connect(DATABASE_URL, row_factory=dict_row)
-
-    conn = sqlite3.connect(SQLITE_DB_PATH)
-    conn.row_factory = sqlite_dict_factory
-    return conn
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL não definido. Configure um Postgres válido, por exemplo: "
+            "postgresql://postgres:postgres@localhost:5432/photos_processor"
+        )
+    return psycopg.connect(DATABASE_URL)
 
 
 def init_db() -> None:
-    if not USING_POSTGRES:
-        logging.warning(
-            "DATABASE_URL não definido para Postgres. Usando SQLite local em %s. "
-            "Defina DATABASE_URL para usar Postgres (local ou hospedado).",
-            SQLITE_DB_PATH,
-        )
-
     with get_conn() as conn:
-        if USING_POSTGRES:
-            with conn.cursor() as cur:
-                cur.execute(
+        with conn.cursor() as cur:
+            cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS images (
                     id VARCHAR(64) PRIMARY KEY,
@@ -122,19 +107,6 @@ def init_db() -> None:
                     mime_type TEXT NOT NULL,
                     size_bytes INTEGER NOT NULL,
                     created_at TIMESTAMPTZ NOT NULL
-                )
-                """
-                )
-        else:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS images (
-                    id TEXT PRIMARY KEY,
-                    filename TEXT NOT NULL,
-                    stored_name TEXT NOT NULL,
-                    mime_type TEXT NOT NULL,
-                    size_bytes INTEGER NOT NULL,
-                    created_at TEXT NOT NULL
                 )
                 """
             )
@@ -186,24 +158,15 @@ def to_image_item(row: dict) -> ImageItem:
 
 def fetch_all_images() -> list[ImageItem]:
     with get_conn() as conn:
-        if USING_POSTGRES:
-            with conn.cursor() as cur:
-                cur.execute(
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
                 """
                 SELECT id, filename, mime_type, size_bytes, created_at
                 FROM images
                 ORDER BY created_at DESC
                 """
-                )
-                rows = cur.fetchall()
-        else:
-            rows = conn.execute(
-                """
-                SELECT id, filename, mime_type, size_bytes, created_at
-                FROM images
-                ORDER BY created_at DESC
-                """
-            ).fetchall()
+            )
+            rows = cur.fetchall()
     return [to_image_item(row) for row in rows]
 
 
@@ -230,27 +193,11 @@ async def upload_image(file: UploadFile = File(...)) -> ImageUploadResponse:
     created_at = datetime.now(timezone.utc).isoformat()
 
     with get_conn() as conn:
-        if USING_POSTGRES:
-            with conn.cursor() as cur:
-                cur.execute(
+        with conn.cursor() as cur:
+            cur.execute(
                 """
                 INSERT INTO images (id, filename, stored_name, mime_type, size_bytes, created_at)
                 VALUES (%s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    image_id,
-                    original_name,
-                    stored_name,
-                    mime_type,
-                    len(image_bytes),
-                    created_at,
-                ),
-            )
-        else:
-            conn.execute(
-                """
-                INSERT INTO images (id, filename, stored_name, mime_type, size_bytes, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     image_id,
@@ -284,23 +231,12 @@ def list_images() -> list[ImageItem]:
 
 def get_image_metadata(image_id: str) -> dict:
     with get_conn() as conn:
-        if USING_POSTGRES:
-            with conn.cursor() as cur:
-                cur.execute(
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
                 """
                 SELECT id, filename, stored_name, mime_type, size_bytes, created_at
                 FROM images
                 WHERE id = %s
-                """,
-                (image_id,),
-                )
-                row = cur.fetchone()
-        else:
-            row = conn.execute(
-                """
-                SELECT id, filename, stored_name, mime_type, size_bytes, created_at
-                FROM images
-                WHERE id = ?
                 """,
                 (image_id,),
             ).fetchone()
