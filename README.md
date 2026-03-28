@@ -11,6 +11,18 @@ API em **FastAPI** para receber imagens via `multipart/form-data`, listar imagen
 
 ## Como rodar
 
+### Opção recomendada: Docker Compose (API + Postgres)
+
+```bash
+docker compose up --build
+```
+
+Serviços disponíveis:
+
+- API: `http://127.0.0.1:8000`
+- Swagger: `http://127.0.0.1:8000/docs`
+- Postgres: `localhost:5432` (`postgres/postgres`, DB `photos_processor`)
+
 ### 1) Subir Postgres local (desenvolvimento)
 
 Opção rápida com Docker:
@@ -31,7 +43,7 @@ export DATABASE_URL="postgresql://postgres:postgres@localhost:5432/photos_proces
 export API_BEARER_TOKEN="seu-token-aqui"
 ```
 
-> Em produção, basta mudar o `DATABASE_URL` para o host do banco hospedado.
+> Em produção, basta mudar o host/credenciais no `DATABASE_URL` para seu banco hospedado.
 
 ### 3) Rodar a aplicação
 
@@ -97,13 +109,16 @@ Este repositório já está preparado para deploy com Vercel usando função Pyt
 - Conta na Vercel
 - Vercel CLI instalada (`npm i -g vercel`)
 
-### 2) Definir variável de ambiente obrigatória
+### 2) Definir variáveis de ambiente
 
 No projeto da Vercel, configure:
 
 - `API_BEARER_TOKEN` = um token forte para autenticação
+- `DATABASE_URL` = string de conexão Postgres hospedado (recomendado para produção)
 
 > Sem essa variável, a API ainda sobe, mas usa token efêmero por instância no ambiente serverless.
+>
+> Se `DATABASE_URL` não for definido, a aplicação faz fallback para SQLite local em `/tmp/photos-processor-data/metadata.db` para manter o app funcional (ambiente efêmero).
 
 ### 3) Fazer o deploy
 
@@ -121,7 +136,7 @@ vercel --prod
 
 No ambiente serverless da Vercel, o filesystem é efêmero. Nesta API, os uploads ficam em `/tmp/photos-processor-data`, ou seja, os arquivos podem ser perdidos entre execuções/cold starts.
 
-Para produção, use armazenamento de imagens externo (ex.: Vercel Blob, S3) e mantenha o Postgres como banco de metadados.
+Para produção, use armazenamento de imagens externo (ex.: Vercel Blob, S3) e Postgres hospedado para metadados.
 
 ## CI para deploy automático (Preview em PR + Produção na main)
 
