@@ -10,7 +10,7 @@ from typing import Annotated, Optional
 
 from dotenv import load_dotenv
 import psycopg
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 from psycopg.rows import dict_row
@@ -95,25 +95,42 @@ def get_conn():
             "DATABASE_URL não definido. Configure um Postgres válido, por exemplo: "
             "postgresql://postgres:postgres@localhost:5432/photos_processor"
         )
-    return psycopg.connect(DATABASE_URL)
+    try:
+        return psycopg.connect(DATABASE_URL, connect_timeout=5)
+    except psycopg.OperationalError as exc:
+        raise RuntimeError("Banco de dados indisponível no momento") from exc
+
+
+def database_unavailable_http_exception() -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail="Banco de dados indisponível no momento. Tente novamente em instantes.",
+    )
 
 
 def init_db() -> None:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS images (
-                    id VARCHAR(64) PRIMARY KEY,
-                    filename TEXT NOT NULL,
-                    stored_name TEXT NOT NULL,
-                    mime_type TEXT NOT NULL,
-                    size_bytes INTEGER NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS images (
+                        id VARCHAR(64) PRIMARY KEY,
+                        filename TEXT NOT NULL,
+                        stored_name TEXT NOT NULL,
+                        mime_type TEXT NOT NULL,
+                        size_bytes INTEGER NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL,
+                        client_ip TEXT NULL,
+                        username TEXT NULL
+                    )
+                    """
                 )
-                """
-            )
-        conn.commit()
+                cur.execute("ALTER TABLE images ADD COLUMN IF NOT EXISTS client_ip TEXT NULL")
+                cur.execute("ALTER TABLE images ADD COLUMN IF NOT EXISTS username TEXT NULL")
+            conn.commit()
+    except RuntimeError:
+        logging.exception("Não foi possível inicializar o banco de dados")
 
 
 @app.get("/health")
@@ -160,16 +177,19 @@ def to_image_item(row: dict) -> ImageItem:
 
 
 def fetch_all_images() -> list[ImageItem]:
-    with get_conn() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(
-                """
-                SELECT id, filename, mime_type, size_bytes, created_at
-                FROM images
-                ORDER BY created_at DESC
-                """
-            )
-            rows = cur.fetchall()
+    try:
+        with get_conn() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT id, filename, mime_type, size_bytes, created_at
+                    FROM images
+                    ORDER BY created_at DESC
+                    """
+                )
+                rows = cur.fetchall()
+    except RuntimeError as exc:
+        raise database_unavailable_http_exception() from exc
     return [to_image_item(row) for row in rows]
 
 
@@ -179,7 +199,11 @@ def fetch_all_images() -> list[ImageItem]:
     status_code=201,
     dependencies=[Depends(require_bearer_auth)],
 )
-async def upload_image(file: UploadFile = File(...)) -> ImageUploadResponse:
+async def upload_image(
+    request: Request,
+    file: UploadFile = File(...),
+    username: Optional[str] = Form(default=None),
+) -> ImageUploadResponse:
     image_bytes = await file.read()
     kind = filetype.guess(image_bytes)
     if kind is None or not kind.mime.startswith('image/'):
@@ -194,24 +218,43 @@ async def upload_image(file: UploadFile = File(...)) -> ImageUploadResponse:
     output_path.write_bytes(image_bytes)
 
     created_at = datetime.now(timezone.utc).isoformat()
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        client_ip = forwarded_for.split(",")[0].strip() or None
+    else:
+        client_ip = request.client.host if request.client else None
 
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO images (id, filename, stored_name, mime_type, size_bytes, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    image_id,
-                    original_name,
-                    stored_name,
-                    mime_type,
-                    len(image_bytes),
-                    created_at,
-                ),
-            )
-        conn.commit()
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO images (
+                        id,
+                        filename,
+                        stored_name,
+                        mime_type,
+                        size_bytes,
+                        created_at,
+                        client_ip,
+                        username
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        image_id,
+                        original_name,
+                        stored_name,
+                        mime_type,
+                        len(image_bytes),
+                        created_at,
+                        client_ip,
+                        username,
+                    ),
+                )
+            conn.commit()
+    except RuntimeError as exc:
+        raise database_unavailable_http_exception() from exc
 
     logging.info(f"Image uploaded successfully: {image_id}, filename: {original_name}, size: {len(image_bytes)} bytes")
 
@@ -233,16 +276,19 @@ def list_images() -> list[ImageItem]:
 
 
 def get_image_metadata(image_id: str) -> dict:
-    with get_conn() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            row = cur.execute(
-                """
-                SELECT id, filename, stored_name, mime_type, size_bytes, created_at
-                FROM images
-                WHERE id = %s
-                """,
-                (image_id,),
-            ).fetchone()
+    try:
+        with get_conn() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                row = cur.execute(
+                    """
+                    SELECT id, filename, stored_name, mime_type, size_bytes, created_at
+                    FROM images
+                    WHERE id = %s
+                    """,
+                    (image_id,),
+                ).fetchone()
+    except RuntimeError as exc:
+        raise database_unavailable_http_exception() from exc
 
     if row is None:
         raise HTTPException(status_code=404, detail="Imagem não encontrada")
