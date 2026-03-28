@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = BASE_DIR / "data"
+DATA_DIR = Path("/tmp/photos-processor-data") if os.getenv("VERCEL") else (BASE_DIR / "data")
 IMAGES_DIR = DATA_DIR / "images"
 DB_PATH = DATA_DIR / "images.db"
 TOKEN_PATH = DATA_DIR / "api_token.txt"
@@ -33,6 +33,10 @@ def load_or_create_api_token() -> str:
             return stored_token
 
     generated_token = secrets.token_urlsafe(32)
+    if os.getenv("VERCEL"):
+        logging.warning("API_BEARER_TOKEN não definido no ambiente Vercel; usando token efêmero por instância.")
+        return generated_token
+
     TOKEN_PATH.write_text(generated_token, encoding="utf-8")
     return generated_token
 
