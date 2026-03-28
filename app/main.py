@@ -34,6 +34,7 @@ db_pool: Optional[ConnectionPool] = None
 
 IMAGE_MAX_DIMENSION = int(os.getenv("IMAGE_MAX_DIMENSION", "1920"))
 IMAGE_JPEG_QUALITY = int(os.getenv("IMAGE_JPEG_QUALITY", "72"))
+IMAGE_RETENTION_DAYS = int(os.getenv("IMAGE_RETENTION_DAYS", "3"))
 
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -235,6 +236,42 @@ def serialize_created_at(value: datetime | str) -> str:
     return value
 
 
+def format_datetime_for_display(value: datetime | str) -> str:
+    iso_value = serialize_created_at(value)
+    try:
+        dt = datetime.fromisoformat(iso_value)
+    except ValueError:
+        return iso_value
+    return dt.astimezone(timezone.utc).strftime("%d/%m/%Y %H:%M:%S UTC")
+
+
+def cleanup_expired_images() -> None:
+    """Remove imagens mais antigas que o período de retenção configurado."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                deleted_rows = cur.execute(
+                    """
+                    DELETE FROM images
+                    WHERE created_at < NOW() - (%s || ' days')::interval
+                    RETURNING stored_name
+                    """,
+                    (IMAGE_RETENTION_DAYS,),
+                ).fetchall()
+            conn.commit()
+    except RuntimeError:
+        logging.warning("Não foi possível executar limpeza de imagens expiradas.")
+        return
+
+    if IS_VERCEL:
+        return
+
+    for row in deleted_rows:
+        file_path = IMAGES_DIR / row["stored_name"]
+        if file_path.exists():
+            file_path.unlink(missing_ok=True)
+
+
 def to_image_item(row: dict) -> ImageItem:
     return ImageItem(
         id=row["id"],
@@ -318,6 +355,7 @@ async def upload_image(
     file: UploadFile = File(...),
     username: Optional[str] = Form(default=None),
 ) -> ImageUploadResponse:
+    cleanup_expired_images()
     uploaded_bytes = await file.read()
     kind = filetype.guess(uploaded_bytes)
     if kind is None or not kind.mime.startswith('image/'):
@@ -393,6 +431,7 @@ def list_images(
     mime_type: Optional[str] = Query(default=None),
     username: Optional[str] = Query(default=None),
 ) -> list[ImageItem]:
+    cleanup_expired_images()
     logging.info("Listing all images")
     items, _ = fetch_images_paginated(
         page=page,
@@ -427,6 +466,7 @@ def get_image_metadata(image_id: str) -> dict:
 
 @app.get("/image/{image_id}")
 def get_image_by_id(image_id: str) -> Response:
+    cleanup_expired_images()
     row = get_image_metadata(image_id)
 
     file_path = IMAGES_DIR / row["stored_name"]
@@ -449,6 +489,7 @@ def gallery(
     mime_type: Optional[str] = Query(default=None),
     username: Optional[str] = Query(default=None),
 ) -> HTMLResponse:
+    cleanup_expired_images()
     logging.info("Serving gallery page")
     images, total_items = fetch_images_paginated(
         page=page,
@@ -491,7 +532,7 @@ def gallery(
             <p><strong>Usuário:</strong> {img.username or "-"}</p>
             <p><strong>ID:</strong> {img.id}</p>
             <p><strong>Tamanho:</strong> {img.size_bytes} bytes</p>
-            <p><strong>Criado em:</strong> {img.created_at}</p>
+            <p><strong>Criado em:</strong> {format_datetime_for_display(img.created_at)}</p>
             <p><a href='/gallery/{img.id}'>Abrir em detalhes</a></p>
         </article>
         """
@@ -660,6 +701,7 @@ def gallery(
 
 @app.get("/gallery/{image_id}", response_class=HTMLResponse)
 def gallery_single(image_id: str) -> HTMLResponse:
+    cleanup_expired_images()
     row = get_image_metadata(image_id)
     img = to_image_item(row)
     logging.info(f"Serving single image page: {image_id}")
@@ -704,7 +746,7 @@ def gallery_single(image_id: str) -> HTMLResponse:
             <li><strong>ID:</strong> {img.id}</li>
             <li><strong>Tipo:</strong> {img.mime_type}</li>
             <li><strong>Tamanho:</strong> {img.size_bytes} bytes</li>
-            <li><strong>Criado em:</strong> {img.created_at}</li>
+            <li><strong>Criado em:</strong> {format_datetime_for_display(img.created_at)}</li>
           </ul>
         </div>
       </body>
