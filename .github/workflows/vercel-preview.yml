@@ -1,0 +1,103 @@
+name: Vercel Deploy
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+
+concurrency:
+  group: vercel-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+    steps:
+      - name: Validate required Vercel secrets
+        id: validate_secrets
+        run: |
+          missing=""
+          [ -z "${{ secrets.VERCEL_TOKEN }}" ] && missing="$missing VERCEL_TOKEN"
+          [ -z "${{ secrets.VERCEL_ORG_ID }}" ] && missing="$missing VERCEL_ORG_ID"
+          [ -z "${{ secrets.VERCEL_PROJECT_ID }}" ] && missing="$missing VERCEL_PROJECT_ID"
+
+          if [ -n "$missing" ]; then
+            echo "has_secrets=false" >> "$GITHUB_OUTPUT"
+            echo "missing_secrets=$missing" >> "$GITHUB_OUTPUT"
+            echo "Secrets ausentes:$missing"
+          else
+            echo "has_secrets=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Comment when secrets are missing
+        if: github.event_name == 'pull_request' && steps.validate_secrets.outputs.has_secrets == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const missing = '${{ steps.validate_secrets.outputs.missing_secrets }}'.trim();
+            const prNumber = context.payload.pull_request.number;
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: `⚠️ Deploy da Vercel não foi executado porque faltam secrets no repositório:${missing}. Configure em Settings → Secrets and variables → Actions.`
+            });
+
+      - name: Checkout
+        if: steps.validate_secrets.outputs.has_secrets == 'true'
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        if: steps.validate_secrets.outputs.has_secrets == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Vercel CLI
+        if: steps.validate_secrets.outputs.has_secrets == 'true'
+        run: npm install --global vercel@latest
+
+      - name: Pull Vercel Environment Information (Preview)
+        if: github.event_name == 'pull_request' && steps.validate_secrets.outputs.has_secrets == 'true'
+        run: vercel pull --yes --environment=preview --token=${{ secrets.VERCEL_TOKEN }}
+
+      - name: Pull Vercel Environment Information (Production)
+        if: github.event_name == 'push' && steps.validate_secrets.outputs.has_secrets == 'true'
+        run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+
+      - name: Build Project Artifacts
+        if: steps.validate_secrets.outputs.has_secrets == 'true'
+        run: vercel build --token=${{ secrets.VERCEL_TOKEN }}
+
+      - name: Deploy Preview to Vercel
+        if: github.event_name == 'pull_request' && steps.validate_secrets.outputs.has_secrets == 'true'
+        id: deploy_preview
+        run: |
+          url=$(vercel deploy --prebuilt --token=${{ secrets.VERCEL_TOKEN }})
+          echo "deployment_url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy Production to Vercel
+        if: github.event_name == 'push' && steps.validate_secrets.outputs.has_secrets == 'true'
+        run: vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }}
+
+      - name: Comment Preview URL on PR
+        if: github.event_name == 'pull_request' && steps.validate_secrets.outputs.has_secrets == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const url = '${{ steps.deploy_preview.outputs.deployment_url }}';
+            const prNumber = context.payload.pull_request.number;
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: `✅ Preview da Vercel publicada: ${url}`
+            });

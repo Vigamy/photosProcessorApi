@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 data/images/*
 data/images.db
+
+data/api_token.txt
+.vercel
