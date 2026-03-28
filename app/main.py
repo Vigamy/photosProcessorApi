@@ -10,7 +10,7 @@ from typing import Annotated, Optional
 
 from dotenv import load_dotenv
 import psycopg
-from psycopg_pool import ConnectionPool
+from psycopg_pool import ConnectionPool, PoolTimeout
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel
@@ -25,6 +25,7 @@ IMAGES_DIR = DATA_DIR / "images"
 TOKEN_PATH = DATA_DIR / "api_token.txt"
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_POOL_MAX_SIZE = int(os.getenv("DB_POOL_MAX_SIZE", "3"))
+USE_DB_POOL = os.getenv("USE_DB_POOL", "").lower() in {"1", "true", "yes"}
 db_pool: Optional[ConnectionPool] = None
 
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
@@ -57,20 +58,23 @@ async def lifespan(app: FastAPI):
     global db_pool
     logging.basicConfig(level=logging.INFO)
     logging.info("Initializing database...")
-    if DATABASE_URL:
+    if DATABASE_URL and USE_DB_POOL:
         db_pool = ConnectionPool(
             conninfo=DATABASE_URL,
-            min_size=1,
+            min_size=0,
             max_size=max(1, DB_POOL_MAX_SIZE),
             kwargs={"connect_timeout": 5},
-            open=True,
-            timeout=5,
+            open=False,
+            timeout=2,
         )
-    init_db()
+    db_ready = init_db()
     logging.info("Bearer token ativo em %s", TOKEN_PATH)
     if not os.getenv("API_BEARER_TOKEN"):
         logging.info("Token gerado automaticamente: %s", API_BEARER_TOKEN)
-    logging.info("Database initialized. Starting FastAPI app.")
+    if db_ready:
+        logging.info("Database initialized. Starting FastAPI app.")
+    else:
+        logging.warning("Database unavailable on startup. API started with degraded mode (DB endpoints may return 503).")
     yield
     if db_pool is not None:
         db_pool.close()
@@ -119,7 +123,7 @@ def get_conn():
             return
         with psycopg.connect(DATABASE_URL, connect_timeout=5) as conn:
             yield conn
-    except psycopg.OperationalError as exc:
+    except (psycopg.OperationalError, PoolTimeout) as exc:
         raise RuntimeError("Banco de dados indisponível no momento") from exc
 
 
@@ -130,7 +134,7 @@ def database_unavailable_http_exception() -> HTTPException:
     )
 
 
-def init_db() -> None:
+def init_db() -> bool:
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -153,8 +157,10 @@ def init_db() -> None:
                 cur.execute("ALTER TABLE images ADD COLUMN IF NOT EXISTS username TEXT NULL")
                 cur.execute("ALTER TABLE images ADD COLUMN IF NOT EXISTS image_data BYTEA NULL")
             conn.commit()
+        return True
     except RuntimeError:
         logging.exception("Não foi possível inicializar o banco de dados")
+        return False
 
 
 @app.get("/health")
