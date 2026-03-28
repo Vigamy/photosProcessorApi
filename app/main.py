@@ -3,25 +3,29 @@ import logging
 import os
 import secrets
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Optional
 
 from dotenv import load_dotenv
 import psycopg
+from psycopg_pool import ConnectionPool
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel
 from psycopg.rows import dict_row
 
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = Path("/tmp/photos-processor-data") if os.getenv("VERCEL") else (BASE_DIR / "data")
+IS_VERCEL = bool(os.getenv("VERCEL"))
+DATA_DIR = Path("/tmp/photos-processor-data") if IS_VERCEL else (BASE_DIR / "data")
 IMAGES_DIR = DATA_DIR / "images"
 TOKEN_PATH = DATA_DIR / "api_token.txt"
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+DB_POOL_MAX_SIZE = int(os.getenv("DB_POOL_MAX_SIZE", "3"))
+db_pool: Optional[ConnectionPool] = None
 
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -50,14 +54,26 @@ API_BEARER_TOKEN = load_or_create_api_token()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global db_pool
     logging.basicConfig(level=logging.INFO)
     logging.info("Initializing database...")
+    if DATABASE_URL:
+        db_pool = ConnectionPool(
+            conninfo=DATABASE_URL,
+            min_size=1,
+            max_size=max(1, DB_POOL_MAX_SIZE),
+            kwargs={"connect_timeout": 5},
+            open=True,
+            timeout=5,
+        )
     init_db()
     logging.info("Bearer token ativo em %s", TOKEN_PATH)
     if not os.getenv("API_BEARER_TOKEN"):
         logging.info("Token gerado automaticamente: %s", API_BEARER_TOKEN)
     logging.info("Database initialized. Starting FastAPI app.")
     yield
+    if db_pool is not None:
+        db_pool.close()
     logging.info("Shutting down FastAPI app.")
 
 
@@ -89,6 +105,7 @@ class ImageItem(BaseModel):
     gallery_url: str
 
 
+@contextmanager
 def get_conn():
     if not DATABASE_URL:
         raise RuntimeError(
@@ -96,7 +113,12 @@ def get_conn():
             "postgresql://postgres:postgres@localhost:5432/photos_processor"
         )
     try:
-        return psycopg.connect(DATABASE_URL, connect_timeout=5)
+        if db_pool is not None:
+            with db_pool.connection() as conn:
+                yield conn
+            return
+        with psycopg.connect(DATABASE_URL, connect_timeout=5) as conn:
+            yield conn
     except psycopg.OperationalError as exc:
         raise RuntimeError("Banco de dados indisponível no momento") from exc
 
@@ -122,12 +144,14 @@ def init_db() -> None:
                         size_bytes INTEGER NOT NULL,
                         created_at TIMESTAMPTZ NOT NULL,
                         client_ip TEXT NULL,
-                        username TEXT NULL
+                        username TEXT NULL,
+                        image_data BYTEA NULL
                     )
                     """
                 )
                 cur.execute("ALTER TABLE images ADD COLUMN IF NOT EXISTS client_ip TEXT NULL")
                 cur.execute("ALTER TABLE images ADD COLUMN IF NOT EXISTS username TEXT NULL")
+                cur.execute("ALTER TABLE images ADD COLUMN IF NOT EXISTS image_data BYTEA NULL")
             conn.commit()
     except RuntimeError:
         logging.exception("Não foi possível inicializar o banco de dados")
@@ -214,8 +238,9 @@ async def upload_image(
     image_id = str(uuid.uuid4())
     original_name = file.filename or f"image-{image_id[:8]}.{ext}"
     stored_name = f"{image_id}.{ext}"
-    output_path = IMAGES_DIR / stored_name
-    output_path.write_bytes(image_bytes)
+    if not IS_VERCEL:
+        output_path = IMAGES_DIR / stored_name
+        output_path.write_bytes(image_bytes)
 
     created_at = datetime.now(timezone.utc).isoformat()
     forwarded_for = request.headers.get("x-forwarded-for")
@@ -237,9 +262,10 @@ async def upload_image(
                         size_bytes,
                         created_at,
                         client_ip,
-                        username
+                        username,
+                        image_data
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         image_id,
@@ -250,6 +276,7 @@ async def upload_image(
                         created_at,
                         client_ip,
                         username,
+                        image_bytes,
                     ),
                 )
             conn.commit()
@@ -281,7 +308,7 @@ def get_image_metadata(image_id: str) -> dict:
             with conn.cursor(row_factory=dict_row) as cur:
                 row = cur.execute(
                     """
-                    SELECT id, filename, stored_name, mime_type, size_bytes, created_at
+                    SELECT id, filename, stored_name, mime_type, size_bytes, created_at, image_data
                     FROM images
                     WHERE id = %s
                     """,
@@ -297,12 +324,15 @@ def get_image_metadata(image_id: str) -> dict:
 
 
 @app.get("/image/{image_id}")
-def get_image_by_id(image_id: str) -> FileResponse:
+def get_image_by_id(image_id: str) -> Response:
     row = get_image_metadata(image_id)
 
     file_path = IMAGES_DIR / row["stored_name"]
     if not file_path.exists():
-        raise HTTPException(status_code=404, detail="Arquivo de imagem não encontrado")
+        image_data = row.get("image_data")
+        if image_data is None:
+            raise HTTPException(status_code=404, detail="Arquivo de imagem não encontrado")
+        return Response(content=image_data, media_type=row["mime_type"])
 
     logging.info(f"Serving image content: {image_id}")
 
