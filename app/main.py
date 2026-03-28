@@ -232,7 +232,7 @@ def list_images() -> list[ImageItem]:
 def get_image_metadata(image_id: str) -> dict:
     with get_conn() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(
+            row = cur.execute(
                 """
                 SELECT id, filename, stored_name, mime_type, size_bytes, created_at
                 FROM images
