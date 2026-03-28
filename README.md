@@ -5,23 +5,41 @@ API em **FastAPI** para receber imagens via `multipart/form-data`, listar imagen
 ## Funcionalidades
 
 - Upload de imagem via `multipart/form-data` (campo `file`).
-- Persistência local em disco (`data/images`) e metadados em SQLite (`data/images.db`).
+- Persistência local em disco (`data/images`) e metadados em PostgreSQL.
 - Autenticação por token Bearer.
 - Listagem de imagens recebidas e download por ID.
 
 ## Como rodar
+
+### 1) Subir Postgres local (desenvolvimento)
+
+Opção rápida com Docker:
+
+```bash
+docker run --name photos-postgres \
+  -e POSTGRES_USER=postgres \
+  -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_DB=photos_processor \
+  -p 5432:5432 \
+  -d postgres:16
+```
+
+### 2) Configurar variáveis de ambiente
+
+```bash
+export DATABASE_URL="postgresql://postgres:postgres@localhost:5432/photos_processor"
+export API_BEARER_TOKEN="seu-token-aqui"
+```
+
+> Em produção, basta mudar o `DATABASE_URL` para o host do banco hospedado.
+
+### 3) Rodar a aplicação
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 uvicorn app.main:app --reload
-```
-
-Você pode definir o token Bearer da API antes de iniciar:
-
-```bash
-export API_BEARER_TOKEN="seu-token-aqui"
 ```
 
 Se `API_BEARER_TOKEN` não for definido, a API gera automaticamente um token e persiste em `data/api_token.txt` (também aparece no log de startup).
@@ -101,9 +119,9 @@ vercel --prod
 
 ### 4) Observações importantes sobre persistência
 
-No ambiente serverless da Vercel, o filesystem é efêmero. Nesta API, os uploads e o SQLite ficam em `/tmp/photos-processor-data`, ou seja, os dados podem ser perdidos entre execuções/cold starts.
+No ambiente serverless da Vercel, o filesystem é efêmero. Nesta API, os uploads ficam em `/tmp/photos-processor-data`, ou seja, os arquivos podem ser perdidos entre execuções/cold starts.
 
-Se você quiser persistência real em produção, troque armazenamento local/SQLite por serviços externos (ex.: Vercel Blob, S3, Postgres, Supabase etc.).
+Para produção, use armazenamento de imagens externo (ex.: Vercel Blob, S3) e mantenha o Postgres como banco de metadados.
 
 ## CI para deploy automático (Preview em PR + Produção na main)
 

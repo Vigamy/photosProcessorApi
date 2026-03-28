@@ -2,3 +2,4 @@ fastapi==0.115.2
 uvicorn==0.32.0
 filetype
 python-multipart==0.0.20
+psycopg[binary]==3.2.10
