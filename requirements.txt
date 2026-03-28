@@ -5,3 +5,4 @@ python-multipart==0.0.20
 psycopg[binary]==3.2.10
 psycopg-pool==3.2.2
 python-dotenv
+Pillow==11.2.1
