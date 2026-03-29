@@ -60,6 +60,21 @@ Acesse:
 
 - Swagger: `http://127.0.0.1:8000/docs`
 - Galeria (lista): `http://127.0.0.1:8000/gallery`
+- Login da galeria: `http://127.0.0.1:8000/login`
+
+### Login da galeria (sem register)
+
+A galeria HTML exige autenticação por formulário de login (somente login, sem registro). Configure:
+
+```bash
+export GALLERY_LOGIN_USERNAME="seu-usuario"
+export GALLERY_LOGIN_PASSWORD="sua-senha-forte"
+export GALLERY_SESSION_SECRET="um-segredo-diferente-do-token"
+export GALLERY_REMEMBER_ME_TTL_SECONDS="2592000"
+```
+
+Se `GALLERY_LOGIN_PASSWORD` não for definido, a API usa o valor de `API_BEARER_TOKEN` como senha de fallback.
+No login, marque **"Lembrar de mim por vários dias"** para manter a sessão por mais tempo (padrão: 30 dias; mínimo recomendado: 7 dias).
 
 ## Endpoints
 
@@ -87,10 +102,16 @@ Retorna lista de imagens com metadados.
 Retorna o binário da imagem por ID.
 
 ### `GET /gallery`
-Página HTML com lista de imagens.
+Página HTML com lista de imagens (protegida por login).
 
 ### `GET /gallery/{id}`
-Página HTML com visualização individual da imagem.
+Página HTML com visualização individual da imagem (protegida por login).
+
+### `GET /login` e `POST /login`
+Tela e submissão de login da galeria.
+
+### `GET /logout`
+Encerra a sessão de login da galeria.
 
 ## Exemplo com `curl` (Bearer + upload)
 

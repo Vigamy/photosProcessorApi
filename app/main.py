@@ -1,8 +1,11 @@
 import filetype
+import hashlib
+import hmac
 import logging
 import os
 import secrets
 import uuid
+from base64 import urlsafe_b64decode, urlsafe_b64encode
 from io import BytesIO
 from urllib.parse import urlencode
 from contextlib import asynccontextmanager, contextmanager
@@ -14,7 +17,7 @@ from dotenv import load_dotenv
 import psycopg
 from psycopg_pool import ConnectionPool, PoolTimeout
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from pydantic import BaseModel
 from PIL import Image, ImageOps
 from psycopg.rows import dict_row
@@ -59,6 +62,12 @@ def load_or_create_api_token() -> str:
 
 
 API_BEARER_TOKEN = load_or_create_api_token()
+GALLERY_LOGIN_USERNAME = os.getenv("GALLERY_LOGIN_USERNAME", "admin")
+GALLERY_LOGIN_PASSWORD = os.getenv("GALLERY_LOGIN_PASSWORD", API_BEARER_TOKEN)
+GALLERY_SESSION_SECRET = os.getenv("GALLERY_SESSION_SECRET", API_BEARER_TOKEN)
+GALLERY_SESSION_COOKIE = "gallery_session"
+GALLERY_SESSION_TTL_SECONDS = int(os.getenv("GALLERY_SESSION_TTL_SECONDS", str(60 * 60 * 12)))
+GALLERY_REMEMBER_ME_TTL_SECONDS = int(os.getenv("GALLERY_REMEMBER_ME_TTL_SECONDS", str(60 * 60 * 24 * 30)))
 
 
 @asynccontextmanager
@@ -195,6 +204,41 @@ def require_bearer_auth(
             detail="Token Bearer inválido",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+
+def create_gallery_session_token(username: str, ttl_seconds: int) -> str:
+    expires_at = int(datetime.now(timezone.utc).timestamp()) + max(60, ttl_seconds)
+    payload = f"{username}|{expires_at}"
+    signature = hmac.new(
+        GALLERY_SESSION_SECRET.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    token_bytes = f"{payload}|{signature}".encode("utf-8")
+    return urlsafe_b64encode(token_bytes).decode("utf-8")
+
+
+def read_gallery_session_username(token: str | None) -> Optional[str]:
+    if not token:
+        return None
+    try:
+        decoded = urlsafe_b64decode(token.encode("utf-8")).decode("utf-8")
+        username, expires_at_str, signature = decoded.split("|", maxsplit=2)
+        payload = f"{username}|{expires_at_str}"
+        expected_signature = hmac.new(
+            GALLERY_SESSION_SECRET.encode("utf-8"),
+            payload.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(signature, expected_signature):
+            return None
+        expires_at = int(expires_at_str)
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        if now_ts > expires_at:
+            return None
+        return username
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def compress_image_for_storage(image_bytes: bytes) -> tuple[bytes, str, str]:
@@ -483,12 +527,18 @@ def get_image_by_id(image_id: str) -> Response:
 
 @app.get("/gallery", response_class=HTMLResponse)
 def gallery(
+    request: Request,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=18, ge=1, le=60),
     filename: Optional[str] = Query(default=None),
     mime_type: Optional[str] = Query(default=None),
     username: Optional[str] = Query(default=None),
 ) -> HTMLResponse:
+    session_user = read_gallery_session_username(request.cookies.get(GALLERY_SESSION_COOKIE))
+    if not session_user:
+        next_query = urlencode({"next": str(request.url.path)})
+        return RedirectResponse(url=f"/login?{next_query}", status_code=303)
+
     cleanup_expired_images()
     logging.info("Serving gallery page")
     images, total_items = fetch_images_paginated(
@@ -662,6 +712,7 @@ def gallery(
           <header class='header'>
             <h1>Galeria de imagens</h1>
             <p>Visualize e filtre os uploads com paginação.</p>
+            <p>Logado como <strong>{session_user}</strong> • <a href='/logout'>Sair</a></p>
             <p><a href='/docs'>Abrir documentação Swagger</a></p>
           </header>
 
@@ -700,7 +751,12 @@ def gallery(
 
 
 @app.get("/gallery/{image_id}", response_class=HTMLResponse)
-def gallery_single(image_id: str) -> HTMLResponse:
+def gallery_single(image_id: str, request: Request) -> HTMLResponse:
+    session_user = read_gallery_session_username(request.cookies.get(GALLERY_SESSION_COOKIE))
+    if not session_user:
+        next_query = urlencode({"next": str(request.url.path)})
+        return RedirectResponse(url=f"/login?{next_query}", status_code=303)
+
     cleanup_expired_images()
     row = get_image_metadata(image_id)
     img = to_image_item(row)
@@ -740,6 +796,7 @@ def gallery_single(image_id: str) -> HTMLResponse:
       <body>
         <div class='panel'>
           <p><a href='/gallery'>← Voltar para galeria</a></p>
+          <p>Logado como <strong>{session_user}</strong> • <a href='/logout'>Sair</a></p>
           <h1>{img.filename}</h1>
           <img src='{img.image_url}' alt='{img.filename}' class='full-image'/>
           <ul>
@@ -753,3 +810,118 @@ def gallery_single(image_id: str) -> HTMLResponse:
     </html>
     """
     return HTMLResponse(content=html)
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page(request: Request, next: str = Query(default="/gallery")) -> HTMLResponse:
+    current_user = read_gallery_session_username(request.cookies.get(GALLERY_SESSION_COOKIE))
+    if current_user:
+        return RedirectResponse(url=next if next.startswith("/") else "/gallery", status_code=303)
+
+    safe_next = next if next.startswith("/") else "/gallery"
+    html = f"""
+    <!DOCTYPE html>
+    <html lang='pt-BR'>
+      <head>
+        <meta charset='UTF-8'/>
+        <meta name='viewport' content='width=device-width, initial-scale=1.0'/>
+        <title>Login da galeria</title>
+        <style>
+          body {{
+            margin: 0;
+            min-height: 100vh;
+            display: grid;
+            place-items: center;
+            background: linear-gradient(180deg, #eef2ff 0%, #dbeafe 100%);
+            font-family: Inter, Arial, sans-serif;
+          }}
+          .card {{
+            width: min(420px, 92vw);
+            background: white;
+            border: 1px solid #dbeafe;
+            border-radius: 14px;
+            padding: 20px;
+            box-shadow: 0 12px 24px rgba(30, 64, 175, 0.15);
+          }}
+          h1 {{ margin-top: 0; }}
+          label {{ display: block; margin-top: 10px; font-weight: 600; }}
+          input {{
+            width: 100%;
+            box-sizing: border-box;
+            margin-top: 6px;
+            padding: 10px;
+            border: 1px solid #cbd5e1;
+            border-radius: 8px;
+          }}
+          button {{
+            margin-top: 14px;
+            width: 100%;
+            border: none;
+            border-radius: 8px;
+            padding: 10px;
+            background: #1d4ed8;
+            color: white;
+            font-weight: 700;
+            cursor: pointer;
+          }}
+        </style>
+      </head>
+      <body>
+        <main class='card'>
+          <h1>Entrar na galeria</h1>
+          <p>Somente usuários autorizados podem visualizar as imagens.</p>
+          <form method='post' action='/login'>
+            <input type='hidden' name='next' value='{safe_next}'/>
+            <label for='username'>Usuário</label>
+            <input id='username' name='username' type='text' required autocomplete='username'/>
+            <label for='password'>Senha</label>
+            <input id='password' name='password' type='password' required autocomplete='current-password'/>
+            <label style='display:flex; align-items:center; gap:8px; font-weight:500;'>
+              <input type='checkbox' name='remember_me' value='1' style='width:auto; margin-top:0;'/>
+              Lembrar de mim por vários dias
+            </label>
+            <button type='submit'>Entrar</button>
+          </form>
+        </main>
+      </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
+
+
+@app.post("/login")
+def login_submit(
+    username: str = Form(...),
+    password: str = Form(...),
+    next: str = Form(default="/gallery"),
+    remember_me: Optional[str] = Form(default=None),
+) -> Response:
+    safe_next = next if next.startswith("/") else "/gallery"
+    if not (
+        hmac.compare_digest(username, GALLERY_LOGIN_USERNAME)
+        and hmac.compare_digest(password, GALLERY_LOGIN_PASSWORD)
+    ):
+        return HTMLResponse(
+            content="<h3>Credenciais inválidas. <a href='/login'>Tentar novamente</a></h3>",
+            status_code=401,
+        )
+
+    remember_requested = remember_me in {"1", "true", "on", "yes"}
+    session_ttl = GALLERY_REMEMBER_ME_TTL_SECONDS if remember_requested else GALLERY_SESSION_TTL_SECONDS
+
+    redirect = RedirectResponse(url=safe_next, status_code=303)
+    redirect.set_cookie(
+        key=GALLERY_SESSION_COOKIE,
+        value=create_gallery_session_token(username, session_ttl),
+        httponly=True,
+        max_age=session_ttl,
+        samesite="lax",
+    )
+    return redirect
+
+
+@app.get("/logout")
+def logout() -> Response:
+    redirect = RedirectResponse(url="/login", status_code=303)
+    redirect.delete_cookie(GALLERY_SESSION_COOKIE)
+    return redirect
