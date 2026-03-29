@@ -70,9 +70,11 @@ A galeria HTML exige autenticação por formulário de login (somente login, sem
 export GALLERY_LOGIN_USERNAME="seu-usuario"
 export GALLERY_LOGIN_PASSWORD="sua-senha-forte"
 export GALLERY_SESSION_SECRET="um-segredo-diferente-do-token"
+export GALLERY_REMEMBER_ME_TTL_SECONDS="2592000"
 ```
 
 Se `GALLERY_LOGIN_PASSWORD` não for definido, a API usa o valor de `API_BEARER_TOKEN` como senha de fallback.
+No login, marque **"Lembrar de mim por vários dias"** para manter a sessão por mais tempo (padrão: 30 dias; mínimo recomendado: 7 dias).
 
 ## Endpoints
 

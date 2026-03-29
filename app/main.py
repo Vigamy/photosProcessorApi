@@ -67,6 +67,7 @@ GALLERY_LOGIN_PASSWORD = os.getenv("GALLERY_LOGIN_PASSWORD", API_BEARER_TOKEN)
 GALLERY_SESSION_SECRET = os.getenv("GALLERY_SESSION_SECRET", API_BEARER_TOKEN)
 GALLERY_SESSION_COOKIE = "gallery_session"
 GALLERY_SESSION_TTL_SECONDS = int(os.getenv("GALLERY_SESSION_TTL_SECONDS", str(60 * 60 * 12)))
+GALLERY_REMEMBER_ME_TTL_SECONDS = int(os.getenv("GALLERY_REMEMBER_ME_TTL_SECONDS", str(60 * 60 * 24 * 30)))
 
 
 @asynccontextmanager
@@ -205,9 +206,9 @@ def require_bearer_auth(
         )
 
 
-def create_gallery_session_token(username: str) -> str:
-    issued_at = int(datetime.now(timezone.utc).timestamp())
-    payload = f"{username}|{issued_at}"
+def create_gallery_session_token(username: str, ttl_seconds: int) -> str:
+    expires_at = int(datetime.now(timezone.utc).timestamp()) + max(60, ttl_seconds)
+    payload = f"{username}|{expires_at}"
     signature = hmac.new(
         GALLERY_SESSION_SECRET.encode("utf-8"),
         payload.encode("utf-8"),
@@ -222,8 +223,8 @@ def read_gallery_session_username(token: str | None) -> Optional[str]:
         return None
     try:
         decoded = urlsafe_b64decode(token.encode("utf-8")).decode("utf-8")
-        username, issued_at_str, signature = decoded.split("|", maxsplit=2)
-        payload = f"{username}|{issued_at_str}"
+        username, expires_at_str, signature = decoded.split("|", maxsplit=2)
+        payload = f"{username}|{expires_at_str}"
         expected_signature = hmac.new(
             GALLERY_SESSION_SECRET.encode("utf-8"),
             payload.encode("utf-8"),
@@ -231,9 +232,9 @@ def read_gallery_session_username(token: str | None) -> Optional[str]:
         ).hexdigest()
         if not hmac.compare_digest(signature, expected_signature):
             return None
-        issued_at = int(issued_at_str)
+        expires_at = int(expires_at_str)
         now_ts = int(datetime.now(timezone.utc).timestamp())
-        if now_ts - issued_at > GALLERY_SESSION_TTL_SECONDS:
+        if now_ts > expires_at:
             return None
         return username
     except Exception:  # noqa: BLE001
@@ -875,6 +876,10 @@ def login_page(request: Request, next: str = Query(default="/gallery")) -> HTMLR
             <input id='username' name='username' type='text' required autocomplete='username'/>
             <label for='password'>Senha</label>
             <input id='password' name='password' type='password' required autocomplete='current-password'/>
+            <label style='display:flex; align-items:center; gap:8px; font-weight:500;'>
+              <input type='checkbox' name='remember_me' value='1' style='width:auto; margin-top:0;'/>
+              Lembrar de mim por vários dias
+            </label>
             <button type='submit'>Entrar</button>
           </form>
         </main>
@@ -889,6 +894,7 @@ def login_submit(
     username: str = Form(...),
     password: str = Form(...),
     next: str = Form(default="/gallery"),
+    remember_me: Optional[str] = Form(default=None),
 ) -> Response:
     safe_next = next if next.startswith("/") else "/gallery"
     if not (
@@ -900,12 +906,15 @@ def login_submit(
             status_code=401,
         )
 
+    remember_requested = remember_me in {"1", "true", "on", "yes"}
+    session_ttl = GALLERY_REMEMBER_ME_TTL_SECONDS if remember_requested else GALLERY_SESSION_TTL_SECONDS
+
     redirect = RedirectResponse(url=safe_next, status_code=303)
     redirect.set_cookie(
         key=GALLERY_SESSION_COOKIE,
-        value=create_gallery_session_token(username),
+        value=create_gallery_session_token(username, session_ttl),
         httponly=True,
-        max_age=GALLERY_SESSION_TTL_SECONDS,
+        max_age=session_ttl,
         samesite="lax",
     )
     return redirect
